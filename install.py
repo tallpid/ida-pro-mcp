@@ -7,7 +7,7 @@ import json
 import argparse
 
 def setup_vscode_config(server_path):
-    config_file = os.path.expanduser("~/.config/Code/User/globalStorage/github.copilot-chat/mcpServers.json")
+    config_file = os.path.expanduser("~/.config/Code/User/mcp.json")
     
     os.makedirs(os.path.dirname(config_file), exist_ok=True)
     

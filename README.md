@@ -13,7 +13,7 @@ Following functions are supported:
 * `ida_get_functions` - List all functions in the current IDB. 
 * `ida_get_function_info <function_ea>` - Get detailed information about a function by its EA.
 * `ida_get_strings` - List all strings in the current IDB.
-* `ida_search_string <search_term>` - Search for a string in the current IDB.
+* `ida_search_text <search_term>` - Search for an ASCII string in the current IDB.
 * `ida_get_segments` - List all segments in the current IDB.
 * `ida_get_decompiler_output <function_ea>` - Get the decompiler output for a function by its EA.
 * `ida_rename_function <function_ea> <new_name>` - Rename a function by its EA
@@ -23,7 +23,6 @@ Following functions are supported:
 * `ida_get_function_type <function_ea>` - Get the function prototype for a function by its EA
 * `ida_set_function_args <function_ea> <arg1_type> <arg2_type> ...` - Set the argument types for a function by its EA
 * `ida_create_bookmark <address> <bookmark_name>` - Create a bookmark at a specific address
-* `ida_rename_variable <function_ea> <old_var_name> <new_var_name>` - Rename a local variable in a function by its EA
 * `ida_rename_variable <function_ea> <old_var_name> <new_var_name>` - Rename a local variable in a function by its EA
 * `ida_set_variable_type <function_ea> <var_name> <new_type>` - Set the type of a local variable in a function by its EA
 
