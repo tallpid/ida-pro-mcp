@@ -392,6 +392,24 @@ class IDAMCPBridge:
                     },
                     'required': ['address', 'var_name', 'var_type']
                 }
+            },
+            'ida_get_xrefs': {
+                'name': 'ida_get_xrefs',
+                'description': 'Get cross-references (xrefs) to and from a location specified by address or name',
+                'inputSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'address': {
+                            'type': 'string',
+                            'description': 'Address in hex format (e.g., 0x401000)'
+                        },
+                        'name': {
+                            'type': 'string',
+                            'description': 'Name of the function, variable, or location'
+                        }
+                    },
+                    'required': []
+                }
             }
         }
 
@@ -562,6 +580,14 @@ class IDAMCPBridge:
                     var_name = arguments.get('var_name', '')
                     var_type = arguments.get('var_type', '')
                     result = self.send_ida_request('set_variable_type', {'address': address, 'var_name': var_name, 'var_type': var_type})
+                elif tool_name == 'ida_get_xrefs':
+                    # Handle both address and name parameters
+                    params = {}
+                    if 'address' in arguments:
+                        params['address'] = self.hex_to_int(arguments.get('address', '0'))
+                    if 'name' in arguments:
+                        params['name'] = arguments.get('name', '')
+                    result = self.send_ida_request('get_xrefs', params)
                 else:
                     result = {'error': f'Unknown tool: {tool_name}'}
                 

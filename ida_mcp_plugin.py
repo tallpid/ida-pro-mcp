@@ -8,6 +8,7 @@ import ida_bytes
 import ida_segment
 import ida_hexrays
 import ida_typeinf
+import ida_search
 import json
 import socket
 import threading
@@ -154,6 +155,8 @@ class IDAMCPServer:
                 result = self._get_local_variables(params.get('address'))
             elif method == 'set_variable_type':
                 result = self._set_variable_type(params.get('address'), params.get('var_name'), params.get('var_type'))
+            elif method == 'get_xrefs':
+                result = self._get_xrefs(params.get('address'), params.get('name'))
             elif method == 'reload_plugin':
                 result = self._reload_plugin()
             else:
@@ -182,10 +185,7 @@ class IDAMCPServer:
 
     def _get_functions(self) -> List[Dict[str, Any]]:
         functions = []
-        count = 0
         for func_ea in idautils.Functions():
-            if count >= 100:
-                break
             func = ida_funcs.get_func(func_ea)
             if func:
                 name = ida_name.get_name(func_ea)
@@ -196,7 +196,6 @@ class IDAMCPServer:
                     'end': f'0x{func.end_ea:x}',
                     'size': func.end_ea - func.start_ea
                 })
-                count += 1
         return functions
 
     def _get_function_info(self, address: int) -> Dict[str, Any]:
@@ -210,16 +209,12 @@ class IDAMCPServer:
         name = ida_name.get_name(func.start_ea)
         
         instructions = []
-        count = 0
         for head in idautils.Heads(func.start_ea, func.end_ea):
-            if count >= 50:
-                break
             disasm = idc.generate_disasm_line(head, 0)
             instructions.append({
                 'address': f'0x{head:x}',
                 'disasm': disasm
             })
-            count += 1
         
         return {
             'address': f'0x{func.start_ea:x}',
@@ -232,16 +227,12 @@ class IDAMCPServer:
 
     def _get_strings(self) -> List[Dict[str, Any]]:
         strings = []
-        count = 0
         for string in idautils.Strings():
-            if count >= 100:
-                break
             strings.append({
                 'address': f'0x{string.ea:x}',
                 'value': str(string)[:200],
                 'length': string.length
             })
-            count += 1
         return strings
 
     def _search_text(self, pattern: str) -> List[Dict[str, Any]]:
@@ -249,24 +240,57 @@ class IDAMCPServer:
             return {'error': 'Pattern required'}
         
         results = []
-        count = 0
-        for seg_ea in idautils.Segments():
-            if count >= 50:
+        seen_addresses = set()  # Track addresses we've already found
+        
+        # Start search from the beginning of the database
+        addr = idc.get_inf_attr(idc.INF_MIN_EA)
+        max_addr = idc.get_inf_attr(idc.INF_MAX_EA)
+        
+        # Safety limit to prevent infinite loops
+        max_iterations = 10000
+        iteration_count = 0
+        
+        while addr < max_addr and iteration_count < max_iterations:
+            iteration_count += 1
+            
+            # Find next occurrence of the pattern using ida_search
+            # SEARCH_DOWN (1) = search forward
+            # SEARCH_CASE (0x01) for case-sensitive, 0 for case-insensitive
+            found_addr = ida_search.find_text(addr, 0, 0, pattern, ida_search.SEARCH_DOWN)
+            
+            if found_addr == idc.BADADDR:
                 break
-            seg = ida_segment.getseg(seg_ea)
+            
+            # If we found the same address again, move forward
+            if found_addr <= addr:
+                addr += 1
+                continue
+            
+            # Check if we've already recorded this address
+            if found_addr in seen_addresses:
+                # Move past this result to avoid infinite loop
+                addr = found_addr + 1
+                continue
+            
+            seen_addresses.add(found_addr)
+            
+            # Get context for the result
+            disasm = idc.generate_disasm_line(found_addr, 0)
+            
+            # Get segment name
+            seg = ida_segment.getseg(found_addr)
+            seg_name = ""
             if seg:
-                addr = seg.start_ea
-                while addr < seg.end_ea and count < 50:
-                    found_addr = idc.find_text(addr, 1, 0, pattern, 0) 
-                    if found_addr == idc.BADADDR or found_addr >= seg.end_ea:
-                        break
-                    
-                    results.append({
-                        'address': f'0x{found_addr:x}',
-                        'context': idc.generate_disasm_line(found_addr, 0)
-                    })
-                    addr = found_addr + 1
-                    count += 1
+                seg_name = ida_segment.get_segm_name(seg)
+            
+            results.append({
+                'address': f'0x{found_addr:x}',
+                'context': disasm,
+                'segment': seg_name
+            })
+            
+            # Move past this result to continue searching
+            addr = found_addr + 1
         
         return results
 
@@ -325,13 +349,24 @@ class IDAMCPServer:
                         'repeatable': repeatable_comment if repeatable_comment else ''
                     }
             
+            # Extract pseudocode lines properly
+            pseudocode_lines = []
+            for sline in cfunc.get_pseudocode():
+                # simpleline_t objects have a 'line' attribute that contains the actual text
+                # Use ida_idaapi.tag_remove or just extract the line directly
+                try:
+                    line_text = ida_idaapi.tag_remove(sline.line)  # Remove color tags
+                except:
+                    line_text = sline.line  # Fallback to raw line if tag_remove fails
+                pseudocode_lines.append(line_text)
+            
             return {
                 'address': f'0x{func.start_ea:x}',
                 'name': name,
                 'start': f'0x{func.start_ea:x}',
                 'end': f'0x{func.end_ea:x}',
                 'decompiled_code': str(cfunc),
-                'pseudocode_lines': [str(line) for line in cfunc.get_pseudocode()],
+                'pseudocode_lines': pseudocode_lines,
                 'function_comment': func_comment if func_comment else '',
                 'function_repeatable_comment': func_repeatable_comment if func_repeatable_comment else '',
                 'instruction_comments': instruction_comments
@@ -631,7 +666,7 @@ class IDAMCPServer:
             return {'error': f'Argument setting error: {str(e)}'}
 
     def _create_bookmark(self, address: int, description: str) -> Dict[str, Any]:
-        """Create a bookmark at the specified address with the given description"""
+
         if not address:
             return {'error': 'Address required'}
         
@@ -646,24 +681,32 @@ class IDAMCPServer:
                 else:
                     address = int(address)
             
-            # In IDA Pro, bookmarks are typically implemented as special comments
-            # We'll use a prefix to identify bookmark comments
-            bookmark_comment = f"BOOKMARK: {description}"
+            # Find the first available bookmark slot (0-1023)
+            slot = -1
+            for i in range(1024):
+                existing_ea = idc.get_bookmark(i)
+                if existing_ea == idc.BADADDR:
+                    slot = i
+                    break
             
-            # Set the comment at the address
-            if idc.set_cmt(address, bookmark_comment, 0):  # 0 = regular comment
+            if slot == -1:
                 return {
-                    'address': f'0x{address:x}',
-                    'description': description,
-                    'success': True,
-                    'message': 'Bookmark created successfully'
-                }
-            else:
-                return {
-                    'address': f'0x{address:x}',
-                    'error': 'Failed to create bookmark comment',
+                    'error': 'No available bookmark slots (maximum 1024 bookmarks)',
                     'success': False
                 }
+            
+            # Create the bookmark using IDA's native bookmark API
+            # put_bookmark(ea, lnnum, x, y, slot, comment)
+            # lnnum, x, y are display coordinates, use 0 for defaults
+            idc.put_bookmark(address, 0, 0, 0, slot, description)
+            
+            return {
+                'address': f'0x{address:x}',
+                'description': description,
+                'slot': slot,
+                'success': True,
+                'message': 'Bookmark created successfully'
+            }
         except Exception as e:
             return {'error': f'Bookmark creation error: {str(e)}'}
 
@@ -672,31 +715,36 @@ class IDAMCPServer:
         try:
             bookmarks = []
             
-            # Iterate through all segments to find bookmark comments
-            for seg_ea in idautils.Segments():
-                seg = ida_segment.getseg(seg_ea)
-                if seg:
-                    # Iterate through all addresses in the segment
-                    for head in idautils.Heads(seg.start_ea, seg.end_ea):
-                        comment = idc.get_cmt(head, 0)  # Regular comment
-                        if comment and comment.startswith('BOOKMARK:'):
-                            # Extract the description from the bookmark comment
-                            description = comment[9:].strip()  # Remove "BOOKMARK:" prefix
-                            
-                            # Get additional context
-                            disasm = idc.generate_disasm_line(head, 0)
-                            func = ida_funcs.get_func(head)
-                            func_name = ""
-                            if func:
-                                func_name = ida_name.get_name(func.start_ea)
-                            
-                            bookmarks.append({
-                                'address': f'0x{head:x}',
-                                'description': description,
-                                'disasm': disasm,
-                                'function': func_name,
-                                'segment': ida_segment.get_segm_name(seg)
-                            })
+            # Iterate through all bookmark slots (0-1023)
+            for slot in range(1024):
+                ea = idc.get_bookmark(slot)
+                if ea != idc.BADADDR:
+                    # Get bookmark description
+                    description = idc.get_bookmark_desc(slot)
+                    if description is None:
+                        description = ""
+                    
+                    # Get additional context
+                    disasm = idc.generate_disasm_line(ea, 0)
+                    func = ida_funcs.get_func(ea)
+                    func_name = ""
+                    if func:
+                        func_name = ida_name.get_name(func.start_ea)
+                    
+                    # Get segment name
+                    seg = ida_segment.getseg(ea)
+                    seg_name = ""
+                    if seg:
+                        seg_name = ida_segment.get_segm_name(seg)
+                    
+                    bookmarks.append({
+                        'address': f'0x{ea:x}',
+                        'description': description,
+                        'slot': slot,
+                        'disasm': disasm,
+                        'function': func_name,
+                        'segment': seg_name
+                    })
             
             return {
                 'bookmarks': bookmarks,
@@ -719,28 +767,30 @@ class IDAMCPServer:
                 else:
                     address = int(address)
             
-            # Check if there's a bookmark at this address
-            comment = idc.get_cmt(address, 0)
-            if not comment or not comment.startswith('BOOKMARK:'):
+            # Find the bookmark slot for this address
+            found_slot = -1
+            for slot in range(1024):
+                ea = idc.get_bookmark(slot)
+                if ea == address:
+                    found_slot = slot
+                    break
+            
+            if found_slot == -1:
                 return {
                     'address': f'0x{address:x}',
                     'error': 'No bookmark found at this address',
                     'success': False
                 }
             
-            # Delete the bookmark comment
-            if idc.set_cmt(address, "", 0):  # Set empty comment to delete
-                return {
-                    'address': f'0x{address:x}',
-                    'success': True,
-                    'message': 'Bookmark deleted successfully'
-                }
-            else:
-                return {
-                    'address': f'0x{address:x}',
-                    'error': 'Failed to delete bookmark',
-                    'success': False
-                }
+            # Delete the bookmark by clearing the slot
+            idc.put_bookmark(idc.BADADDR, 0, 0, 0, found_slot, "")
+            
+            return {
+                'address': f'0x{address:x}',
+                'slot': found_slot,
+                'success': True,
+                'message': 'Bookmark deleted successfully'
+            }
         except Exception as e:
             return {'error': f'Bookmark deletion error: {str(e)}'}
 
@@ -758,8 +808,9 @@ class IDAMCPServer:
             if enum_id != ida_idaapi.BADADDR:
                 return {'error': f'Enum "{enum_name}" already exists'}
             
-            # Create the enum
-            enum_id = idc.add_enum(ida_idaapi.BADADDR, enum_name, idc.hex_flag())
+            # Create the enum (use 0 for default flags - decimal enum)
+            # For hex display, could use idaapi.hex_flag() but keeping simple with 0
+            enum_id = idc.add_enum(ida_idaapi.BADADDR, enum_name, 0)
             if enum_id == ida_idaapi.BADADDR:
                 return {'error': 'Failed to create enum'}
             
@@ -805,42 +856,47 @@ class IDAMCPServer:
         try:
             enums = []
             
-            # Get all enums using idc functions
-            for enum_idx in range(idc.get_enum_qty()):
-                enum_id = idc.getn_enum(enum_idx)
-                if enum_id != ida_idaapi.BADADDR:
-                    enum_name = idc.get_enum_name(enum_id)
-                    
-                    # Get enum members
-                    members = []
-                    # Get first member
-                    first_member = idc.get_first_enum_member(enum_id)
-                    if first_member != ida_idaapi.BADADDR:
-                        member_name = idc.get_enum_member_name(first_member)
-                        member_value = idc.get_enum_member_value(first_member)
-                        members.append({
-                            'name': member_name,
-                            'value': member_value
-                        })
-                        
-                        # Get subsequent members
-                        next_member = first_member
-                        while True:
-                            next_member = idc.get_next_enum_member(enum_id, next_member)
-                            if next_member == ida_idaapi.BADADDR:
-                                break
-                            member_name = idc.get_enum_member_name(next_member)
-                            member_value = idc.get_enum_member_value(next_member)
-                            members.append({
-                                'name': member_name,
-                                'value': member_value
-                            })
-                    
-                    enums.append({
-                        'id': f'0x{enum_id:x}',
-                        'name': enum_name,
-                        'members': members
+            # Get the local type library
+            til = ida_typeinf.get_idati()
+            if not til:
+                return {'enums': [], 'total_count': 0, 'success': False, 'error': 'Failed to get type library'}
+            
+            # Iterate through all numbered types to find enums
+            limit = ida_typeinf.get_ordinal_limit(til)
+            for ordinal in range(1, limit):
+                # Get the type at this ordinal
+                tif = ida_typeinf.tinfo_t()
+                if not tif.get_numbered_type(til, ordinal):
+                    continue
+                
+                # Check if it's an enum
+                if not tif.is_enum():
+                    continue
+                
+                # Get enum name
+                enum_name = ida_typeinf.get_numbered_type_name(til, ordinal)
+                if not enum_name:
+                    enum_name = f"enum_{ordinal}"
+                
+                # Get enum details
+                ei = ida_typeinf.enum_type_data_t()
+                if not tif.get_enum_details(ei):
+                    continue
+                
+                # Get enum members
+                members = []
+                for edm in ei:
+                    members.append({
+                        'name': edm.name,
+                        'value': edm.value
                     })
+                
+                enums.append({
+                    'ordinal': ordinal,
+                    'name': enum_name,
+                    'members': members,
+                    'member_count': len(members)
+                })
             
             return {
                 'enums': enums,
@@ -885,26 +941,27 @@ class IDAMCPServer:
                 if not field_name:
                     continue
                 
-                # Map common types to IDA flags and sizes
+                # Map common types to sizes (IDA will infer the type from size)
+                # Modern IDA uses simpler flags - just use FF_DATA with size
                 type_flags = ida_bytes.FF_DATA
                 if field_type == 'byte':
-                    type_flags |= ida_bytes.FF_BYTE
+                    type_flags |= ida_bytes.FF_BYTE if hasattr(ida_bytes, 'FF_BYTE') else 0
                     field_size = 1
                 elif field_type == 'word':
-                    type_flags |= ida_bytes.FF_WORD
+                    type_flags |= ida_bytes.FF_WORD if hasattr(ida_bytes, 'FF_WORD') else 0
                     field_size = 2
                 elif field_type == 'dword' or field_type == 'int':
-                    type_flags |= ida_bytes.FF_DWORD
+                    type_flags |= ida_bytes.FF_DWORD if hasattr(ida_bytes, 'FF_DWORD') else 0
                     field_size = 4
                 elif field_type == 'qword':
-                    type_flags |= ida_bytes.FF_QWORD
+                    type_flags |= ida_bytes.FF_QWORD if hasattr(ida_bytes, 'FF_QWORD') else 0
                     field_size = 8
                 elif field_type.endswith('*'):
-                    type_flags |= ida_bytes.FF_POINTER
-                    field_size = 8 if ida_idaapi.get_inf_structure().is_64bit() else 4
+                    field_size = 8  # Pointer size on 64-bit
                 
                 # Add the field to the structure using idc
-                if idc.add_struc_member(struct_id, field_name, current_offset, type_flags, ida_idaapi.BADADDR, field_size) == 0:
+                # Use -1 for automatic type based on size
+                if idc.add_struc_member(struct_id, field_name, current_offset, ida_bytes.FF_DATA, -1, field_size) == 0:
                     added_fields.append({
                         'name': field_name,
                         'type': field_type,
@@ -930,33 +987,47 @@ class IDAMCPServer:
         try:
             structs = []
             
-            # Get all structures using idc functions
-            for struct_idx in range(idc.get_struc_qty()):
-                struct_id = idc.get_struc_by_idx(struct_idx)
-                if struct_id != ida_idaapi.BADADDR:
-                    struct_name = idc.get_struc_name(struct_id)
-                    struct_size = idc.get_struc_size(struct_id)
+            # Use idautils.Structs() which returns (ordinal, sid, name) tuples
+            for struct_idx, struct_id, struct_name in idautils.Structs():
+                if struct_id == idc.BADADDR:
+                    continue
+                
+                struct_size = idc.get_struc_size(struct_id)
+                
+                # Get struct members using idc
+                members = []
+                offset = 0
+                max_members = 1000  # Safety limit
+                member_count = 0
+                
+                # Iterate through structure offsets
+                while offset < struct_size and member_count < max_members:
+                    member_count += 1
+                    member_name = idc.get_member_name(struct_id, offset)
                     
-                    # Get struct members
-                    members = []
-                    member_qty = idc.get_member_qty(struct_id)
-                    for i in range(member_qty):
-                        member_name = idc.get_member_name(struct_id, i)
-                        member_offset = idc.get_member_offset(struct_id, member_name)
-                        member_size = idc.get_member_size(struct_id, i)
-                        if member_name:
-                            members.append({
-                                'name': member_name,
-                                'offset': member_offset,
-                                'size': member_size
-                            })
-                    
-                    structs.append({
-                        'id': f'0x{struct_id:x}',
-                        'name': struct_name,
-                        'size': struct_size,
-                        'members': members
-                    })
+                    if member_name:
+                        # Get member size
+                        member_size = idc.get_member_size(struct_id, offset)
+                        if member_size <= 0:
+                            member_size = 1  # Minimum size
+                        
+                        members.append({
+                            'name': member_name,
+                            'offset': offset,
+                            'size': member_size
+                        })
+                        
+                        offset += member_size
+                    else:
+                        # No member at this offset, move forward
+                        offset += 1
+                
+                structs.append({
+                    'id': f'0x{struct_id:x}',
+                    'name': struct_name,
+                    'size': struct_size,
+                    'members': members
+                })
             
             return {
                 'structs': structs,
@@ -1129,6 +1200,137 @@ class IDAMCPServer:
             
         except Exception as e:
             return {'error': f'Variable type setting error: {str(e)}'}
+
+    def _get_xrefs(self, address: Optional[int] = None, name: Optional[str] = None) -> Dict[str, Any]:
+        """Get cross-references (xrefs) to a location specified by address or name"""
+        try:
+            target_ea = None
+            
+            # Resolve target address from name or address
+            if name:
+                # Try to get address from name
+                target_ea = idc.get_name_ea_simple(name)
+                if target_ea == idc.BADADDR:
+                    return {'error': f'Name "{name}" not found in database'}
+            elif address:
+                # Convert string address to integer if needed
+                if isinstance(address, str):
+                    if address.startswith('0x'):
+                        target_ea = int(address, 16)
+                    else:
+                        target_ea = int(address)
+                else:
+                    target_ea = address
+            else:
+                return {'error': 'Either address or name is required'}
+            
+            # Validate the address
+            if target_ea == idc.BADADDR:
+                return {'error': 'Invalid address'}
+            
+            # Get the name at this address for context
+            target_name = ida_name.get_name(target_ea)
+            if not target_name:
+                target_name = f"loc_{target_ea:x}"
+            
+            # Collect xrefs TO this address
+            xrefs_to = []
+            for xref in idautils.XrefsTo(target_ea, 0):
+                xref_type_name = self._get_xref_type_name(xref.type)
+                
+                # Get context for the xref
+                disasm = idc.generate_disasm_line(xref.frm, 0)
+                
+                # Get function name containing the xref
+                func = ida_funcs.get_func(xref.frm)
+                func_name = ""
+                if func:
+                    func_name = ida_name.get_name(func.start_ea)
+                
+                # Get segment name
+                seg = ida_segment.getseg(xref.frm)
+                seg_name = ""
+                if seg:
+                    seg_name = ida_segment.get_segm_name(seg)
+                
+                xrefs_to.append({
+                    'from_address': f'0x{xref.frm:x}',
+                    'to_address': f'0x{xref.to:x}',
+                    'type': xref_type_name,
+                    'type_code': xref.type,
+                    'is_code': xref.iscode == 1,
+                    'disasm': disasm,
+                    'function': func_name,
+                    'segment': seg_name
+                })
+            
+            # Collect xrefs FROM this address
+            xrefs_from = []
+            for xref in idautils.XrefsFrom(target_ea, 0):
+                xref_type_name = self._get_xref_type_name(xref.type)
+                
+                # Get the name of the target
+                to_name = ida_name.get_name(xref.to)
+                if not to_name:
+                    to_name = f"loc_{xref.to:x}"
+                
+                # Get context
+                disasm = idc.generate_disasm_line(xref.frm, 0)
+                
+                # Get function containing the target
+                func = ida_funcs.get_func(xref.to)
+                func_name = ""
+                if func:
+                    func_name = ida_name.get_name(func.start_ea)
+                
+                # Get segment name
+                seg = ida_segment.getseg(xref.to)
+                seg_name = ""
+                if seg:
+                    seg_name = ida_segment.get_segm_name(seg)
+                
+                xrefs_from.append({
+                    'from_address': f'0x{xref.frm:x}',
+                    'to_address': f'0x{xref.to:x}',
+                    'to_name': to_name,
+                    'type': xref_type_name,
+                    'type_code': xref.type,
+                    'is_code': xref.iscode == 1,
+                    'disasm': disasm,
+                    'function': func_name,
+                    'segment': seg_name
+                })
+            
+            return {
+                'target_address': f'0x{target_ea:x}',
+                'target_name': target_name,
+                'xrefs_to': xrefs_to,
+                'xrefs_to_count': len(xrefs_to),
+                'xrefs_from': xrefs_from,
+                'xrefs_from_count': len(xrefs_from),
+                'success': True
+            }
+            
+        except Exception as e:
+            return {'error': f'Xref retrieval error: {str(e)}'}
+    
+    def _get_xref_type_name(self, xref_type: int) -> str:
+        """Convert xref type code to human-readable name"""
+        xref_types = {
+            0: 'Data_Unknown',
+            1: 'Data_Offset',
+            2: 'Data_Write',
+            3: 'Data_Read',
+            4: 'Data_Text',
+            5: 'Data_Informational',
+            16: 'Code_Far_Call',
+            17: 'Code_Near_Call',
+            18: 'Code_Far_Jump',
+            19: 'Code_Near_Jump',
+            20: 'Code_User',
+            21: 'Ordinary_Flow'
+        }
+        return xref_types.get(xref_type, f'Unknown_{xref_type}')
 
 
 class IDAMCPPlugin(ida_idaapi.plugin_t):
