@@ -410,6 +410,28 @@ class IDAMCPBridge:
                     },
                     'required': []
                 }
+            },
+            'ida_get_hexdump': {
+                'name': 'ida_get_hexdump',
+                'description': 'Extract binary data from a specified address and return as hexdump',
+                'inputSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'address': {
+                            'type': 'string',
+                            'description': 'Start address in hex format (e.g., 0x401000)'
+                        },
+                        'size': {
+                            'type': 'integer',
+                            'description': 'Number of bytes to extract (default: 256, max: 65536)'
+                        },
+                        'width': {
+                            'type': 'integer',
+                            'description': 'Number of bytes per line in hexdump (default: 16)'
+                        }
+                    },
+                    'required': ['address']
+                }
             }
         }
 
@@ -588,6 +610,11 @@ class IDAMCPBridge:
                     if 'name' in arguments:
                         params['name'] = arguments.get('name', '')
                     result = self.send_ida_request('get_xrefs', params)
+                elif tool_name == 'ida_get_hexdump':
+                    address = self.hex_to_int(arguments.get('address', '0'))
+                    size = arguments.get('size', 256)
+                    width = arguments.get('width', 16)
+                    result = self.send_ida_request('get_hexdump', {'address': address, 'size': size, 'width': width})
                 else:
                     result = {'error': f'Unknown tool: {tool_name}'}
                 

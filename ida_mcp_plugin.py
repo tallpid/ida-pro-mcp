@@ -157,6 +157,8 @@ class IDAMCPServer:
                 result = self._set_variable_type(params.get('address'), params.get('var_name'), params.get('var_type'))
             elif method == 'get_xrefs':
                 result = self._get_xrefs(params.get('address'), params.get('name'))
+            elif method == 'get_hexdump':
+                result = self._get_hexdump(params.get('address'), params.get('size', 256), params.get('width', 16))
             elif method == 'reload_plugin':
                 result = self._reload_plugin()
             else:
@@ -1331,6 +1333,84 @@ class IDAMCPServer:
             21: 'Ordinary_Flow'
         }
         return xref_types.get(xref_type, f'Unknown_{xref_type}')
+
+    def _get_hexdump(self, address: int, size: int = 256, width: int = 16) -> Dict[str, Any]:
+        """Extract binary data from specified address and return as hexdump"""
+        if not address:
+            return {'error': 'Address required'}
+        
+        # Validate and limit size
+        if size <= 0:
+            return {'error': 'Size must be greater than 0'}
+        
+        # Limit maximum size to prevent excessive data transfer
+        max_size = 65536  # 64KB max
+        if size > max_size:
+            size = max_size
+        
+        # Validate width
+        if width <= 0:
+            width = 16
+        if width > 64:
+            width = 64
+        
+        try:
+            # Check if address is valid
+            if not ida_bytes.is_loaded(address):
+                return {'error': f'Address 0x{address:x} is not loaded in the database'}
+            
+            # Read bytes from IDA database
+            data = ida_bytes.get_bytes(address, size)
+            if data is None:
+                return {'error': f'Failed to read {size} bytes from address 0x{address:x}'}
+            
+            # Generate hexdump
+            hexdump_lines = []
+            ascii_chars = []
+            
+            for i in range(0, len(data), width):
+                chunk = data[i:i+width]
+                
+                # Format address
+                line_addr = address + i
+                addr_str = f'{line_addr:08x}'
+                
+                # Format hex bytes
+                hex_str = ' '.join(f'{b:02x}' for b in chunk)
+                
+                # Pad hex string if chunk is smaller than width
+                if len(chunk) < width:
+                    hex_str += '   ' * (width - len(chunk))
+                
+                # Format ASCII representation
+                ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                
+                # Combine into line
+                line = f'{addr_str}  {hex_str}  |{ascii_str}|'
+                hexdump_lines.append(line)
+            
+            # Also provide raw hex string for programmatic use
+            raw_hex = data.hex()
+            
+            # Get segment information
+            seg = ida_segment.getseg(address)
+            seg_name = ""
+            if seg:
+                seg_name = ida_segment.get_segm_name(seg)
+            
+            return {
+                'address': f'0x{address:x}',
+                'size': len(data),
+                'requested_size': size,
+                'width': width,
+                'segment': seg_name,
+                'hexdump': '\n'.join(hexdump_lines),
+                'raw_hex': raw_hex,
+                'success': True
+            }
+            
+        except Exception as e:
+            return {'error': f'Hexdump error: {str(e)}'}
 
 
 class IDAMCPPlugin(ida_idaapi.plugin_t):
